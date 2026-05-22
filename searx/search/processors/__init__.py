@@ -5,6 +5,7 @@ __all__ = [
     "OfflineParamTypes",
     "OnlineCurrenciesParams",
     "OnlineDictParams",
+    "OnlineFanoutProcessor",
     "OnlineParamTypes",
     "OnlineParams",
     "OnlineUrlSearchParams",
@@ -24,6 +25,7 @@ from .online import OnlineProcessor, OnlineParams
 from .online_dictionary import OnlineDictionaryProcessor, OnlineDictParams
 from .online_currency import OnlineCurrencyProcessor, OnlineCurrenciesParams
 from .online_url_search import OnlineUrlSearchProcessor, OnlineUrlSearchParams
+from .online_fanout import OnlineFanoutProcessor
 
 logger = logger.getChild("search.processors")
 
@@ -42,6 +44,7 @@ class ProcessorMap(dict[str, EngineProcessor]):
         OnlineDictionaryProcessor.engine_type: OnlineDictionaryProcessor,
         OnlineCurrencyProcessor.engine_type: OnlineCurrencyProcessor,
         OnlineUrlSearchProcessor.engine_type: OnlineUrlSearchProcessor,
+        OnlineFanoutProcessor.engine_type: OnlineFanoutProcessor,
     }
 
     def init(self, engine_list: list[dict[str, t.Any]]):
