@@ -19,7 +19,6 @@ Two layers of coverage:
 """
 
 import http.server
-import socket
 import threading
 import time
 import types
@@ -148,22 +147,62 @@ class TestOnlineFanoutProcessor(SearxTestCase):
         self.assertIsInstance(results, list)
         self.assertEqual(len(results), 5)  # type: ignore[arg-type]
 
-    def test_returns_none_when_all_subrequests_fail(self):
+    def test_all_subrequests_fail_reraises_for_base_handler(self):
+        """When every sub-request fails, the processor must re-raise so
+        :py:meth:`OnlineProcessor.search` can run its SSL/timeout/captcha
+        suspension policy. Partial failures (some successes) are *not*
+        re-raised — those are downgraded to secondary error counters."""
         urls = [f"https://example.com/{i}" for i in range(2)]
         engine = _make_engine(request_list=[Request.get(u) for u in urls])
         engine.response = lambda resp: []
         proc = self._build_processor(engine)
 
-        fake_responses = [
-            httpx.TimeoutException("a", request=None),
-            httpx.TimeoutException("b", request=None),
-        ]
+        first_exc = httpx.TimeoutException("a", request=None)
+        fake_responses = [first_exc, httpx.TimeoutException("b", request=None)]
         with patch.object(searx.network, "multi_requests", return_value=fake_responses), patch(
             "searx.search.processors.online_fanout.count_error"
         ):
-            result = proc._search_basic("test", {})  # type: ignore[arg-type]
+            with self.assertRaises(httpx.TimeoutException) as ctx:
+                proc._search_basic("test", {})  # type: ignore[arg-type]
 
-        self.assertIsNone(result)
+        # the first exception (in request-order) is the one re-raised, so the
+        # base handler sees a representative failure rather than a generic one.
+        self.assertIs(ctx.exception, first_exc)
+
+    def test_standard_engine_response_sees_per_page_params(self):
+        """The pagination path must hand each response its own per-page
+        ``search_params`` — not the outer ``params`` — so engines parsing
+        results read the correct ``pageno``/context for that response."""
+        received_pagenos: list[int] = []
+
+        def standard_request(query, params):  # pylint: disable=unused-argument
+            params["url"] = f"https://example.com/?page={params['pageno']}"
+
+        def response_fn(resp):
+            # the engine's response() reads pageno off resp.search_params
+            received_pagenos.append(resp.search_params["pageno"])
+            return [{"title": "ok", "url": str(resp.url)}]
+
+        engine = types.SimpleNamespace()
+        engine.name = "fake-paged"
+        engine.timeout = 5.0
+        engine.fanout_pages = 3
+        engine.request = standard_request
+        engine.response = response_fn
+
+        proc = OnlineFanoutProcessor.__new__(OnlineFanoutProcessor)
+        proc.engine = engine
+
+        def fake_multi(request_list):
+            return [_make_response(url=r.url) for r in request_list]
+
+        params = {**default_request_params(), "pageno": 1}
+        with patch.object(searx.network, "multi_requests", side_effect=fake_multi):
+            proc._search_basic("hi", params)  # type: ignore[arg-type]
+
+        # each response saw the pageno that produced its sub-request, not the
+        # outer params' pageno=1
+        self.assertEqual(received_pagenos, [1, 2, 3])
 
 
 # ---------------------------------------------------------------------------
@@ -192,12 +231,6 @@ class _SleepyHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 class TestOnlineFanoutPerf(SearxTestCase):
     """Measure that ``multi_requests`` actually parallelizes — i.e. that the
     fan-out processor delivers the speedup it claims.
@@ -211,9 +244,10 @@ class TestOnlineFanoutPerf(SearxTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.port = _free_port()
-        # ThreadingHTTPServer so the server itself can handle many concurrent connections
-        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", cls.port), _SleepyHandler)
+        # Bind to port 0 directly — the OS picks a free port atomically with
+        # the bind, so there's no TOCTOU window between selection and use.
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SleepyHandler)
+        cls.port = cls.server.server_address[1]
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
 

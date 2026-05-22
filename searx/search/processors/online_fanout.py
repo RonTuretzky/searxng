@@ -16,8 +16,19 @@ APIs are supported:
    custom fan-out semantics (sub-queries, sharded backends, multi-provider
    aggregation) rather than parallel pagination.
 
-The processor inherits :py:class:`OnlineProcessor`'s full error / timeout /
-SSL / captcha / metrics handling.
+Error policy
+~~~~~~~~~~~~
+
+:py:func:`searx.network.multi_requests` returns exceptions in the response
+list rather than raising them. To preserve the parent
+:py:class:`OnlineProcessor.search` flow — which handles SSL / timeout /
+captcha / rate-limit suspension — this processor:
+
+- treats single sub-request failures as *partial* failures: increments a
+  secondary error counter and keeps the surviving results, and
+- re-raises the first sub-request exception when **every** sub-request
+  failed (so the engine looks fully broken to the base handler, which can
+  then suspend it).
 
 .. note::
 
@@ -26,7 +37,7 @@ SSL / captcha / metrics handling.
    cannot use this processor without a custom :py:func:`requests` implementation.
 """
 
-__all__ = ["OnlineFanoutProcessor"]
+__all__ = ["OnlineFanoutProcessor", "DEFAULT_FANOUT_PAGES"]
 
 import copy
 import typing as t
@@ -44,30 +55,40 @@ if t.TYPE_CHECKING:
 DEFAULT_FANOUT_PAGES = 4
 
 
+# A pair of (Request descriptor, params dict that produced it). Tracking the
+# params per request lets each response see its own per-page context — required
+# for engines that read pageno / time_range / etc. off ``resp.search_params``
+# in their ``response()`` parser.
+_SubRequest = tuple[searx.network.Request, "OnlineParams"]
+
+
 class OnlineFanoutProcessor(OnlineProcessor):
     """Processor for engines that fan out one user query into many parallel HTTP requests."""
 
     engine_type: str = "online_fanout"
 
-    def _build_request_list(self, query: str, params: OnlineParams) -> list[searx.network.Request]:
-        """Return the list of sub-requests for one user query.
+    def _build_request_list(self, query: str, params: OnlineParams) -> list[_SubRequest]:
+        """Return the list of (sub-request, per-request params) pairs.
 
         Dispatches on the engine's API:
 
         - If the engine defines ``requests(query, params)`` → use it directly.
-        - Else fall back to ``request(query, params_for_page)`` looped over
+          All sub-requests share the same outer ``params`` dict (the engine
+          decided to fan out itself, so it owns context per request).
+        - Else fall back to ``request(query, page_params)`` looped over
           ``pageno = 1..fanout_pages``, building one :py:class:`network.Request`
-          per page from the populated params.
+          per page from the populated params and remembering the per-page
+          params so each response can be parsed with the right context.
         """
         engine_requests_fn = getattr(self.engine, "requests", None)
         if callable(engine_requests_fn):
-            return list(engine_requests_fn(query, params))
+            return [(req, params) for req in engine_requests_fn(query, params)]
 
         fanout_pages: int = int(getattr(self.engine, "fanout_pages", DEFAULT_FANOUT_PAGES))
         if fanout_pages < 1:
             fanout_pages = 1
 
-        request_list: list[searx.network.Request] = []
+        sub_requests: list[_SubRequest] = []
         for pageno in range(1, fanout_pages + 1):
             page_params: OnlineParams = copy.deepcopy(params)  # type: ignore[assignment]
             page_params["pageno"] = pageno  # type: ignore[typeddict-item]
@@ -79,9 +100,9 @@ class OnlineFanoutProcessor(OnlineProcessor):
             if not page_params.get("url"):
                 continue
 
-            request_list.append(self._params_to_request(page_params))
+            sub_requests.append((self._params_to_request(page_params), page_params))
 
-        return request_list
+        return sub_requests
 
     @staticmethod
     def _params_to_request(params: OnlineParams) -> searx.network.Request:
@@ -124,15 +145,19 @@ class OnlineFanoutProcessor(OnlineProcessor):
     def _search_basic(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, query: str, params: OnlineParams
     ) -> "EngineResults | list | None":
-        request_list = self._build_request_list(query, params)
-        if not request_list:
+        sub_requests = self._build_request_list(query, params)
+        if not sub_requests:
             return None
 
+        request_list = [req for req, _ in sub_requests]
         responses = searx.network.multi_requests(request_list)
 
         merged: list = []
-        for sub_request, resp in zip(request_list, responses):
+        first_exception: BaseException | None = None
+        for (sub_request, sub_params), resp in zip(sub_requests, responses):
             if isinstance(resp, Exception):
+                if first_exception is None:
+                    first_exception = resp
                 count_error(
                     self.engine.name,
                     "fanout subrequest failed: {0}".format(resp.__class__.__name__),
@@ -142,14 +167,19 @@ class OnlineFanoutProcessor(OnlineProcessor):
                 continue
 
             # ``response()`` reads ``search_params`` off the httpx.Response —
-            # match the contract used by the standard online flow.
-            resp.search_params = params  # type: ignore[attr-defined]
+            # use the per-request params so the engine sees the right pageno
+            # (and any other per-page context) for THIS response.
+            resp.search_params = sub_params  # type: ignore[attr-defined]
             sub_results = self.engine.response(resp)
             if sub_results:
                 merged.extend(sub_results)
 
+        # If nothing came back AND every sub-request raised, propagate so the
+        # parent OnlineProcessor.search() can apply its SSL / timeout / captcha
+        # / rate-limit suspension policy. Partial failures (some successes) are
+        # treated as a degraded-but-OK engine — the secondary error counters
+        # above record them without suspending the engine.
+        if not merged and first_exception is not None:
+            raise first_exception
+
         return merged or None
-
-
-# expose the default for engine modules and tests that want to refer to it
-__all__.append("DEFAULT_FANOUT_PAGES")
